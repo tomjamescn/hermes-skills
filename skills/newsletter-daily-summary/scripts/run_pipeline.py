@@ -2,17 +2,12 @@
 """
 Newsletter Daily Summary — 完整流水线入口。
 
-一次性完成：Gmail 拉取 → LLM 聚合分析 → 飞书消息 → 飞书云文档 → TTS 语音
-
-依赖工具（按需调用）：
-  - text_to_speech : 生成语音（必须有）
-  - feishu_doc     : 创建飞书云文档（可选，没有则跳过）
-  - send_message   : 发送飞书消息（必须有）
+数据获取 + 报告生成（由 Agent 自身 LLM 完成分析）
+→ Telegram 消息 + Google Docs 文档 + TTS 语音
 
 用法：
   python run_pipeline.py
-  FEISHU_DM_CHAT_ID=oc_xxx python run_pipeline.py
-  FEISHU_DM_CHAT_ID=oc_xxx GMAIL_QUERY="label:newsletter newer_than:2d" python run_pipeline.py
+  GMAIL_QUERY="label:newsletter newer_than:2d" python run_pipeline.py
 """
 
 import os
@@ -33,9 +28,8 @@ OUTPUT_DIR = os.environ.get("TTS_OUTPUT_DIR", f"{HERMES_HOME}/cron/output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── 环境变量 ──────────────────────────────────────────────
-FEISHU_DM_CHAT_ID = os.environ.get("FEISHU_DM_CHAT_ID", "oc_a627eed988bd27f34e6d3d3df07b5431")
-GMAIL_QUERY       = os.environ.get("GMAIL_QUERY", "label:newsletter newer_than:1d")
-TTS_VOICE         = os.environ.get("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
+GMAIL_QUERY          = os.environ.get("GMAIL_QUERY", "label:newsletter newer_than:1d")
+GOOGLE_DOCS_FOLDER_ID = os.environ.get("GOOGLE_DOCS_FOLDER_ID", "")
 
 # ── Step 1: Gmail 拉取 ────────────────────────────────────
 def fetch_newsletters():
@@ -59,7 +53,7 @@ def fetch_newsletters():
         print(f"❌ JSON 解析失败: {e}\nstdout: {result.stdout[:200]}", file=sys.stderr)
         return []
 
-# ── Step 2: 构建 LLM 分析 prompt ─────────────────────────
+# ── Step 2: 生成分析 prompt（供 Agent LLM 使用）──────────
 def build_analysis_prompt(newsletters):
     today = datetime.now().strftime("%Y-%m-%d")
     nl = "\n"
@@ -69,7 +63,7 @@ def build_analysis_prompt(newsletters):
         for n in newsletters
     ])
     email_bodies = nl.join([
-        f"### [{n.get('source', '未知')}] {n.get('subject', '')}\n{n.get('body', '')[:600]}"
+        f"### [{n.get('source', '未知')}] {n.get('subject', '')}\n{n.get('body', '')[:800]}"
         for n in newsletters
     ])
 
@@ -80,7 +74,7 @@ def build_analysis_prompt(newsletters):
 ## 邮件清单
 {email_list}
 
-## 各邮件正文摘要（各取前600字符）
+## 各邮件正文摘要（各取前800字符）
 {email_bodies}
 
 ---
@@ -132,56 +126,17 @@ def build_analysis_prompt(newsletters):
 """
     return prompt
 
-# ── Step 3: 调用 LLM（通过外部脚本）──────────────────────
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
-LLM_MODEL    = os.environ.get("LLM_MODEL", "gpt-4o")
-LLM_API_KEY  = os.environ.get("OPENAI_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
-
-def call_llm(prompt: str) -> str:
-    """通过 OpenAI-compatible API 调用 LLM 生成分析报告。"""
-    print("🤖 正在调用 LLM 进行聚合分析...", flush=True)
-
-    if LLM_PROVIDER == "openai" or not LLM_PROVIDER:
-        try:
-            import openai
-        except ImportError:
-            subprocess.check_call([VENV_PYTHON, "-m", "pip", "install", "--quiet", "openai"])
-            import openai
-        client = openai.OpenAI(api_key=LLM_API_KEY or os.environ.get("OPENAI_API_KEY"))
-        response = client.chat.completions.create(
-            model=LLM_MODEL or "gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-        )
-        return response.choices[0].message.content
-
-    elif LLM_PROVIDER == "anthropic":
-        try:
-            import anthropic
-        except ImportError:
-            subprocess.check_call([VENV_PYTHON, "-m", "pip", "install", "--quiet", "anthropic"])
-            import anthropic
-        client = anthropic.Anthropic(api_key=LLM_API_KEY or os.environ.get("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
-            model=LLM_MODEL or "claude-sonnet-4",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text
-
-    else:
-        raise ValueError(f"不支持的 LLM_PROVIDER: {LLM_PROVIDER}")
-
-# ── Step 4: 保存分析报告 ─────────────────────────────────
-def save_report(report: str, newsletters) -> str:
+# ── Step 3: 保存原始邮件数据（供 Agent 后续使用）────────
+def save_raw_data(newsletters) -> str:
+    """将原始 newsletter 数据保存为 JSON，供 Agent 分析使用。"""
     today = datetime.now().strftime("%Y%m%d")
-    path = f"{OUTPUT_DIR}/newsletter_report_{today}.md"
+    path = f"{OUTPUT_DIR}/newsletters_raw_{today}.json"
     with open(path, "w") as f:
-        f.write(report)
-    print(f"💾 报告已保存: {path}", flush=True)
+        json.dump(newsletters, f, ensure_ascii=False, indent=2)
+    print(f"💾 原始数据已保存: {path}", flush=True)
     return path
 
-# ── Step 5: 提取 TTS 文本 ────────────────────────────────
+# ── Step 4: 提取 TTS 文本（通用提取函数）────────────────
 def extract_tts_text(report: str) -> str:
     """从报告中提取「共振信号 + 核心洞察」用于 TTS，限制在 800 字以内。"""
     lines = report.split("\n")
@@ -222,42 +177,31 @@ def extract_tts_text(report: str) -> str:
 
     return text
 
-# ── Step 6: 发送飞书消息 ─────────────────────────────────
-def feishu_available() -> bool:
-    """检测 send_message 工具是否可用（通过检查环境或简单探测）。"""
-    # Hermes Agent 总是可以通过 send_message 发送，脚本层返回指令让 Agent 执行
-    return True
-
-def format_feishu_message(report: str, count: int) -> str:
-    today = datetime.now().strftime("%Y-%m-%d")
-    header = f"# 📬 Newsletter 日报 · {today}\n> 📊 信息密度：高 | 共 {count} 封\n\n---\n\n"
-    return header + report
-
-# ── 工具调用指令（供 Agent 执行）─────────────────────────
-def get_tool_instructions(report: str, tts_text: str, feishu_target: str, feishu_msg: str) -> dict:
+# ── 输出指令（供 Agent 执行）──────────────────────────────
+def get_agent_instructions(newsletters, raw_data_path, tts_text, analysis_prompt) -> dict:
     """
-    返回需要 Agent 执行的工具调用指令。
-    返回结构：
-      {
-        "feishu_message": { "action": "send", "target": "...", "message": "..." },
-        "feishu_doc":     { "doc_token": "..." } | None,
-        "tts":            { "text": "..." } | None,
-      }
+    返回供 Hermes Agent 执行的所有指令。
+    Agent 使用自身大模型完成分析，然后推送结果。
     """
-    instructions = {
-        "feishu_message": {
+    return {
+        "telegram": {
             "action": "send",
-            "target": feishu_target,
-            "message": feishu_msg,
+            "target": "telegram",  # 使用 home channel，由 Agent 自动路由
         },
-        "feishu_doc": None,   # Agent 检测到 feishu_doc 工具可用时创建
         "tts": {
             "text": tts_text,
             "output_path": f"{OUTPUT_DIR}/newsletter_tts_{datetime.now().strftime('%Y%m%d')}.mp3",
-            "voice": TTS_VOICE,
         },
+        "google_docs": {
+            "folder_id": GOOGLE_DOCS_FOLDER_ID or None,
+        },
+        "raw_data": {
+            "path": raw_data_path,
+            "count": len(newsletters),
+            "sources": [{"source": n.get("source"), "subject": n.get("subject")} for n in newsletters],
+        },
+        "analysis_prompt": analysis_prompt,
     }
-    return instructions
 
 # ── 主流水线 ─────────────────────────────────────────────
 def main():
@@ -271,41 +215,38 @@ def main():
         print("❌ 没有获取到任何 newsletter，退出。", file=sys.stderr)
         sys.exit(1)
 
-    # Step 2: 构建 prompt
-    prompt = build_analysis_prompt(newsletters)
+    # Step 2: 保存原始数据
+    raw_data_path = save_raw_data(newsletters)
 
-    # Step 3: 调用 LLM
-    try:
-        report = call_llm(prompt)
-    except Exception as e:
-        print(f"❌ LLM 调用失败: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Step 3: 构建分析 prompt（供 Agent 使用）
+    analysis_prompt = build_analysis_prompt(newsletters)
+    prompt_path = f"{OUTPUT_DIR}/newsletter_prompt_{datetime.now().strftime('%Y%m%d')}.txt"
+    with open(prompt_path, "w") as f:
+        f.write(analysis_prompt)
+    print(f"📝 分析 prompt 已保存: {prompt_path}", flush=True)
 
-    # Step 4: 保存报告
-    report_path = save_report(report, newsletters)
+    # Step 4: 预提取 TTS 文本（从各邮件摘要中提取共振/洞察）
+    # 在 Agent 完成分析前，尝试从现有 newsletter 内容中提取关键信息作为 TTS 候选
+    tts_candidates = []
+    for n in newsletters:
+        body = n.get("body", "")[:500]
+        if body:
+            tts_candidates.append(body)
+    pre_tts_text = "\n\n".join(tts_candidates)[:800] if tts_candidates else ""
 
-    # Step 5: 提取 TTS 文本
-    tts_text = extract_tts_text(report)
-    tts_path = f"{OUTPUT_DIR}/newsletter_tts_{datetime.now().strftime('%Y%m%d')}.txt"
-    with open(tts_path, "w") as f:
-        f.write(tts_text)
-    print(f"📝 TTS 文本已保存: {tts_path}（{len(tts_text)} 字）", flush=True)
+    # Step 5: 生成 Agent 指令
+    instructions = get_agent_instructions(newsletters, raw_data_path, pre_tts_text, analysis_prompt)
 
-    # Step 6: 准备工具调用指令
-    feishu_target = f"feishu:{FEISHU_DM_CHAT_ID}"
-    feishu_msg = format_feishu_message(report, len(newsletters))
-    instructions = get_tool_instructions(report, tts_text, feishu_target, feishu_msg)
-
-    # 输出指令 JSON（供 Agent 解析）
+    # 输出指令 JSON
     print("\n" + "=" * 50)
-    print("✅ 流水线执行完成，以下步骤需 Agent 工具执行：")
+    print("✅ 数据获取完成，以下步骤由 Agent 智能体执行：")
     print("=" * 50)
     print(json.dumps(instructions, ensure_ascii=False, indent=2))
 
-    # 同时输出文件路径供直接引用
-    print(f"\n📄 报告文件: {report_path}")
-    print(f"📝 TTS 文本: {tts_path}")
-    print(f"🔊 TTS 音频: {instructions['tts']['output_path']}")
+    print(f"\n📋 Newsletter 数量: {len(newsletters)}")
+    print(f"📄 原始数据: {raw_data_path}")
+    print(f"📝 分析 prompt: {prompt_path}")
+    print(f"🔊 TTS 候选文本: （{len(pre_tts_text)} 字）")
 
 if __name__ == "__main__":
     main()
